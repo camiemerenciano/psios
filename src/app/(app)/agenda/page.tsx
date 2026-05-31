@@ -1,7 +1,13 @@
 import { createClient } from '@/lib/supabase/server'
 import Link from 'next/link'
-import { Video, Plus, Users } from 'lucide-react'
+import { Video, Plus, Users, CalendarDays, ExternalLink } from 'lucide-react'
 import { formatDateTime } from '@/lib/utils'
+import {
+  getValidAccessToken,
+  fetchCalendarEvents,
+  googleEventStart,
+  type GoogleEvent,
+} from '@/lib/google-calendar'
 
 const STATUS_LABELS: Record<string, { label: string; color: string }> = {
   agendada:  { label: 'Agendada',  color: 'bg-blue-400/15 text-blue-400' },
@@ -14,28 +20,62 @@ export default async function AgendaPage() {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
 
-  const today = new Date()
-  const startOfWeek = new Date(today)
+  const today        = new Date()
+  const startOfWeek  = new Date(today)
   startOfWeek.setDate(today.getDate() - today.getDay())
-  const endOfWeek = new Date(startOfWeek)
+  startOfWeek.setHours(0, 0, 0, 0)
+  const endOfWeek    = new Date(startOfWeek)
   endOfWeek.setDate(startOfWeek.getDate() + 6)
+  endOfWeek.setHours(23, 59, 59, 999)
 
-  const { data: sessions } = await supabase
-    .from('sessions')
-    .select('*, patient:patients(name)')
-    .eq('psychologist_id', user!.id)
-    .gte('scheduled_at', startOfWeek.toISOString())
-    .lte('scheduled_at', endOfWeek.toISOString())
-    .order('scheduled_at')
+  const [{ data: sessions }, { data: upcoming }, { data: profile }] = await Promise.all([
+    supabase
+      .from('sessions')
+      .select('*, patient:patients(name)')
+      .eq('psychologist_id', user!.id)
+      .gte('scheduled_at', startOfWeek.toISOString())
+      .lte('scheduled_at', endOfWeek.toISOString())
+      .order('scheduled_at'),
 
-  const { data: upcoming } = await supabase
-    .from('sessions')
-    .select('*, patient:patients(name)')
-    .eq('psychologist_id', user!.id)
-    .gte('scheduled_at', new Date().toISOString())
-    .eq('status', 'agendada')
-    .order('scheduled_at')
-    .limit(10)
+    supabase
+      .from('sessions')
+      .select('*, patient:patients(name)')
+      .eq('psychologist_id', user!.id)
+      .gte('scheduled_at', new Date().toISOString())
+      .eq('status', 'agendada')
+      .order('scheduled_at')
+      .limit(10),
+
+    supabase
+      .from('profiles')
+      .select('google_access_token, google_refresh_token, google_token_expiry, google_calendar_connected')
+      .eq('id', user!.id)
+      .single(),
+  ])
+
+  // Fetch Google Calendar events
+  let googleWeekEvents: GoogleEvent[]     = []
+  let googleUpcoming:   GoogleEvent[]     = []
+  const isGoogleConnected = profile?.google_calendar_connected ?? false
+
+  if (isGoogleConnected && profile) {
+    const accessToken = await getValidAccessToken(profile, async (newToken, expiry) => {
+      await supabase.from('profiles').update({
+        google_access_token: newToken,
+        google_token_expiry: expiry,
+      }).eq('id', user!.id)
+    })
+
+    if (accessToken) {
+      const upcomingMax = new Date()
+      upcomingMax.setDate(upcomingMax.getDate() + 30)
+
+      ;[googleWeekEvents, googleUpcoming] = await Promise.all([
+        fetchCalendarEvents(accessToken, startOfWeek.toISOString(), endOfWeek.toISOString()),
+        fetchCalendarEvents(accessToken, new Date().toISOString(), upcomingMax.toISOString()),
+      ])
+    }
+  }
 
   const days = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb']
 
@@ -46,20 +86,47 @@ export default async function AgendaPage() {
           <h1 className="text-xl font-semibold text-foreground">Agenda</h1>
           <p className="text-sm text-muted-foreground mt-0.5">Semana atual</p>
         </div>
-        <Link href="/sessoes" className="flex items-center gap-2 px-4 py-2 rounded-lg bg-primary hover:bg-primary/90 text-primary-foreground text-sm font-medium transition-all">
-          <Plus size={15} />
-          Nova sessão
-        </Link>
+        <div className="flex items-center gap-2">
+          {isGoogleConnected && (
+            <span className="flex items-center gap-1.5 text-xs text-emerald-500 bg-emerald-500/10 px-2.5 py-1.5 rounded-lg border border-emerald-500/20">
+              <CalendarDays size={12} /> Google Agenda sincronizado
+            </span>
+          )}
+          <Link href="/sessoes" className="flex items-center gap-2 px-4 py-2 rounded-lg bg-primary hover:bg-primary/90 text-primary-foreground text-sm font-medium transition-all">
+            <Plus size={15} />
+            Nova sessão
+          </Link>
+        </div>
       </div>
 
-      {/* Week view */}
+      {!isGoogleConnected && (
+        <div className="flex items-center justify-between rounded-xl bg-card border border-border px-5 py-4">
+          <div className="flex items-center gap-3">
+            <CalendarDays size={16} className="text-muted-foreground" />
+            <div>
+              <p className="text-sm font-medium text-foreground">Conecte o Google Agenda</p>
+              <p className="text-xs text-muted-foreground">Veja seus eventos do Google junto com suas sessões</p>
+            </div>
+          </div>
+          <Link href="/analise/configuracoes" className="text-xs px-3 py-1.5 rounded-lg border border-border text-muted-foreground hover:text-foreground transition-colors">
+            Conectar
+          </Link>
+        </div>
+      )}
+
+      {/* Week grid */}
       <div className="rounded-xl bg-card border border-border overflow-hidden">
         <div className="grid grid-cols-7 border-b border-border">
           {Array.from({ length: 7 }).map((_, i) => {
             const d = new Date(startOfWeek)
             d.setDate(startOfWeek.getDate() + i)
-            const isToday = d.toDateString() === today.toDateString()
-            const daySessions = sessions?.filter(s => new Date(s.scheduled_at).toDateString() === d.toDateString()) ?? []
+            const isToday      = d.toDateString() === today.toDateString()
+            const daySessions  = sessions?.filter(s => new Date(s.scheduled_at).toDateString() === d.toDateString()) ?? []
+            const dayGoogleEvt = googleWeekEvents.filter(e => {
+              const start = googleEventStart(e)
+              return start ? new Date(start).toDateString() === d.toDateString() : false
+            })
+
             return (
               <div key={i} className={`p-3 border-r last:border-r-0 border-border min-h-24 ${isToday ? 'bg-primary/5' : ''}`}>
                 <div className="flex flex-col items-center mb-2">
@@ -74,6 +141,17 @@ export default async function AgendaPage() {
                       {new Date(s.scheduled_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })} {(s.patient as { name: string } | null)?.name?.split(' ')[0]}
                     </div>
                   ))}
+                  {dayGoogleEvt.map(e => {
+                    const start = googleEventStart(e)
+                    const time  = start && e.start.dateTime
+                      ? new Date(start).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
+                      : 'dia todo'
+                    return (
+                      <div key={e.id} className="text-[10px] bg-emerald-500/15 text-emerald-500 rounded px-1.5 py-0.5 truncate">
+                        {time} {e.summary ?? 'Evento'}
+                      </div>
+                    )
+                  })}
                 </div>
               </div>
             )
@@ -87,13 +165,14 @@ export default async function AgendaPage() {
           <Users size={15} className="text-primary" />
           <h2 className="text-sm font-semibold text-foreground">Próximas sessões</h2>
         </div>
-        {!upcoming || upcoming.length === 0 ? (
+
+        {(!upcoming || upcoming.length === 0) && googleUpcoming.length === 0 ? (
           <div className="py-10 text-center">
             <p className="text-sm text-muted-foreground">Nenhuma sessão agendada</p>
           </div>
         ) : (
           <div className="divide-y divide-border">
-            {upcoming.map((s: { id: string; scheduled_at: string; modality: string; status: string; fee?: number | null; patient?: { name: string } | null }) => {
+            {upcoming?.map((s: { id: string; scheduled_at: string; modality: string; status: string; patient?: { name: string } | null }) => {
               const st = STATUS_LABELS[s.status] ?? STATUS_LABELS.agendada
               return (
                 <div key={s.id} className="flex items-center gap-4 px-5 py-3.5">
@@ -107,6 +186,33 @@ export default async function AgendaPage() {
                     <p className="text-xs text-muted-foreground">{formatDateTime(s.scheduled_at)}</p>
                   </div>
                   <span className={`text-[11px] px-2 py-0.5 rounded-full ${st.color}`}>{st.label}</span>
+                </div>
+              )
+            })}
+
+            {googleUpcoming.slice(0, 10).map(e => {
+              const start = googleEventStart(e)
+              return (
+                <div key={e.id} className="flex items-center gap-4 px-5 py-3.5">
+                  <div className="w-9 h-9 rounded-lg bg-emerald-500/10 flex items-center justify-center shrink-0">
+                    <CalendarDays size={15} className="text-emerald-500" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-foreground truncate">
+                      {e.summary ?? 'Evento sem título'}
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      {start ? formatDateTime(start) : 'Dia todo'}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-500">Google</span>
+                    {e.htmlLink && (
+                      <a href={e.htmlLink} target="_blank" rel="noopener noreferrer" className="text-muted-foreground hover:text-foreground transition-colors">
+                        <ExternalLink size={13} />
+                      </a>
+                    )}
+                  </div>
                 </div>
               )
             })}
