@@ -92,7 +92,7 @@ export default function AgendaPage() {
         .single(),
     ])
 
-    setSessions((sess ?? []) as Session[])
+    setSessions((sess ?? []) as unknown as Session[])
     const connected = prof?.google_calendar_connected ?? false
     setGoogleConnected(connected)
 
